@@ -1,0 +1,1245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI Render — Type, render, download</title>
+<link rel="stylesheet" href="ai_render.css" />
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>AI Render</h1>
+    <div class="sub">Type a description → fetch reference photos → render → download PNG or 3D model</div>
+  </div>
+  <div class="sub">Three.js · Wikipedia photos · GLB export</div>
+</header>
+
+<div id="error-banner"></div>
+
+<main>
+
+  <aside class="panel">
+
+    <h2>Scene description</h2>
+    <textarea id="prompt" placeholder="e.g. a brass desk lamp on a stone pedestal, dramatic lighting">a brass teapot on a wooden table, dramatic lighting</textarea>
+    <div class="hint">
+      Mention objects, materials (<code>brass</code>, <code>glass</code>, <code>wood</code>, <code>marble</code>…), colors, count (<code>three</code>, <code>a few</code>), and mood. With photo references on, the generator pulls a real photo from Wikipedia and uses it as the surface texture.
+    </div>
+
+    <h2>Try a preset</h2>
+    <div class="chips" id="presets"></div>
+
+    <h2>Reference photos</h2>
+    <div class="toggle">
+      <label for="use-photos">Use Wikipedia reference photos</label>
+      <input type="checkbox" id="use-photos" checked />
+    </div>
+    <div id="thumb-strip" class="thumb-strip"></div>
+    <div class="hint">
+      Honest caveat: the mesh stays a procedural primitive — the photo is applied as a texture, not reconstructed into geometry. Real image-to-3D requires a backend ML service (e.g. Meshy AI). For that path, see the <code>ai_render_unreal/</code> project in this folder.
+    </div>
+
+    <h2>Lighting</h2>
+    <select id="lighting">
+      <option value="studio">Studio — neutral 3-point</option>
+      <option value="dramatic" selected>Dramatic — single key light</option>
+      <option value="sunset">Sunset — warm low sun</option>
+      <option value="overcast">Overcast — soft diffuse</option>
+      <option value="night_neon">Night neon — dark + accents</option>
+      <option value="outdoor_sunny">Outdoor sunny — bright sky</option>
+    </select>
+
+    <h2>Camera</h2>
+    <div class="seg" id="camera">
+      <button data-value="hero" class="active">Hero</button>
+      <button data-value="front">Front</button>
+      <button data-value="top">Top</button>
+      <button data-value="closeup">Close-up</button>
+    </div>
+
+    <h2>Animation</h2>
+    <select id="anim-mode">
+      <option value="none">None — static</option>
+      <option value="rotate" selected>Spin — Y-axis rotation</option>
+      <option value="bob">Bob — gentle float up/down</option>
+      <option value="spin_bob">Spin + bob</option>
+      <option value="orbit_camera">Orbit camera around scene</option>
+      <option value="tumble">Tumble — all-axis spin</option>
+    </select>
+    <div class="slider-row" style="margin-top:8px;">
+      <label class="slider-label" for="anim-speed">Speed</label>
+      <input type="range" id="anim-speed" min="0.1" max="3" step="0.1" value="1" />
+      <span id="anim-speed-out">1.0×</span>
+    </div>
+
+    <h2>Generate</h2>
+    <div class="actions">
+      <button class="primary" id="generate">Render scene</button>
+    </div>
+
+    <h2>Download</h2>
+    <div class="actions">
+      <button class="ghost" id="dl-png" disabled>↓ PNG (image)</button>
+      <button class="ghost" id="dl-glb" disabled>↓ GLB (3D model)</button>
+      <button class="ghost" id="dl-webm" disabled>↓ Record video (WebM)</button>
+      <div class="slider-row">
+        <label class="slider-label" for="rec-duration">Length</label>
+        <input type="range" id="rec-duration" min="1" max="15" step="1" value="5" />
+        <span id="rec-duration-out">5s</span>
+      </div>
+      <div class="hint">GLB opens in Unreal, Blender, Maya, glTF Viewer, etc. WebM plays in any modern browser/VLC and converts cleanly to MP4 with FFmpeg if needed.</div>
+    </div>
+
+    <h2>Generation log</h2>
+    <details open>
+      <summary>Show details</summary>
+      <pre id="log">Awaiting first render…</pre>
+    </details>
+
+  </aside>
+
+  <section class="stage">
+    <div id="boot">Loading Three.js…</div>
+    <div id="canvas-wrap" style="display:none;"></div>
+    <div class="overlay">
+      <div class="badge"><span class="label">Objects</span><span id="obj-count">0</span></div>
+      <div class="badge"><span class="label">Polys</span><span id="poly-count">0</span></div>
+    </div>
+    <div class="status" id="status">Loading…</div>
+  </section>
+
+</main>
+
+<script>
+// Boot diagnostics — surfaces any pre-module error visibly so we never end
+// up debugging a black canvas without information.
+(function () {
+  var banner = document.getElementById("error-banner");
+  function showError(msg) {
+    banner.style.display = "block";
+    banner.textContent = msg;
+    var s = document.getElementById("status");
+    if (s) s.innerHTML = '<span class="err">Error — see banner above.</span>';
+  }
+  window.addEventListener("error", function (e) {
+    showError("Script error: " + (e.message || e.error || "unknown") + " @ " + (e.filename || "") + ":" + (e.lineno || "?"));
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    showError("Async error: " + (e.reason && e.reason.message || e.reason || "unknown"));
+  });
+  window.__showError = showError;
+})();
+</script>
+
+<!-- ES-module loading via import map. Works in all current browsers. -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+"use strict";
+
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
+
+(function () {
+
+  // ===============================================================
+  // 1. THREE.JS SETUP
+  // ===============================================================
+  var wrap  = document.getElementById("canvas-wrap");
+  var stage = wrap.parentNode;
+  var bootMsg = document.getElementById("boot");
+
+  var renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      preserveDrawingBuffer: true,    // PNG export
+      alpha: false,
+    });
+  } catch (e) {
+    window.__showError("WebGL not supported: " + e.message);
+    return;
+  }
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  if (THREE.SRGBColorSpace !== undefined) renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  wrap.appendChild(renderer.domElement);
+  wrap.style.display = "block";
+  if (bootMsg) bootMsg.style.display = "none";
+
+  var scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1a1f29);
+
+  var camera = new THREE.PerspectiveCamera(40, 1, 0.1, 1000);
+  camera.position.set(6, 4, 8);
+
+  var controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.target.set(0, 1, 0);
+
+  var sceneRoot = new THREE.Group(); scene.add(sceneRoot);
+  var lightRoot = new THREE.Group(); scene.add(lightRoot);
+
+  function getStageSize() {
+    var r = stage.getBoundingClientRect();
+    return { w: Math.max(50, Math.floor(r.width)), h: Math.max(50, Math.floor(r.height)) };
+  }
+  function resize() {
+    var s = getStageSize();
+    renderer.setSize(s.w, s.h, false);
+    camera.aspect = s.w / s.h;
+    camera.updateProjectionMatrix();
+  }
+  window.addEventListener("resize", resize);
+  if (window.ResizeObserver) new ResizeObserver(resize).observe(stage);
+
+  // ---------- animation state ----------
+  var animState = { mode: "rotate", speed: 1.0 };
+  var clockStart = performance.now();
+  var orbitInitial = null;  // captured when entering orbit_camera mode
+
+  function applyAnimation(dt, t) {
+    var mode = animState.mode;
+    var speed = animState.speed;
+    if (mode === "none") return;
+
+    // For per-object motion: rotate the whole sceneRoot's children except the ground (CircleGeometry first child)
+    var movers = sceneRoot.children.filter(function (c, i) { return i !== 0; });
+
+    if (mode === "rotate" || mode === "spin_bob") {
+      movers.forEach(function (m) { m.rotation.y += dt * 0.6 * speed; });
+    }
+    if (mode === "tumble") {
+      movers.forEach(function (m) {
+        m.rotation.y += dt * 0.6 * speed;
+        m.rotation.x += dt * 0.35 * speed;
+      });
+    }
+    if (mode === "bob" || mode === "spin_bob") {
+      movers.forEach(function (m, idx) {
+        if (m.userData._baseY === undefined) m.userData._baseY = m.position.y;
+        m.position.y = m.userData._baseY + Math.sin(t * 1.6 * speed + idx * 0.7) * 0.15;
+      });
+    }
+    if (mode === "orbit_camera") {
+      if (!orbitInitial) {
+        orbitInitial = {
+          offset: camera.position.clone().sub(controls.target),
+          target: controls.target.clone()
+        };
+      }
+      var radius = Math.sqrt(orbitInitial.offset.x*orbitInitial.offset.x + orbitInitial.offset.z*orbitInitial.offset.z);
+      var theta = t * 0.4 * speed;
+      camera.position.set(
+        orbitInitial.target.x + Math.cos(theta) * radius,
+        orbitInitial.target.y + orbitInitial.offset.y,
+        orbitInitial.target.z + Math.sin(theta) * radius
+      );
+      camera.lookAt(orbitInitial.target);
+    } else {
+      orbitInitial = null;
+    }
+  }
+
+  function resetAnimationBaselines() {
+    sceneRoot.children.forEach(function (c) { if (c.userData) delete c.userData._baseY; });
+    orbitInitial = null;
+    clockStart = performance.now();
+  }
+
+  var lastFrameTime = performance.now();
+  function animate() {
+    var now = performance.now();
+    var dt = Math.min(0.066, (now - lastFrameTime) / 1000);
+    lastFrameTime = now;
+    var t = (now - clockStart) / 1000;
+    applyAnimation(dt, t);
+    if (animState.mode !== "orbit_camera") controls.update();
+    renderer.render(scene, camera);
+    requestAnimationFrame(animate);
+  }
+
+  // ===============================================================
+  // 2. PROMPT PARSER — synonyms, stemming, adjectives, numbers
+  // ===============================================================
+
+  // Synonym groups: each row collapses to the leftmost canonical word.
+  // The parser looks for any synonym and treats it as the canonical.
+  var SYNONYMS = {
+    lamp:     ["lamp", "lantern", "lampshade", "light fixture"],
+    teapot:   ["teapot", "kettle", "pot"],
+    chair:    ["chair", "seat", "stool", "throne", "armchair"],
+    table:    ["table", "desk", "workbench", "counter"],
+    house:    ["house", "cabin", "cottage", "building", "shack", "hut", "home"],
+    pedestal: ["pedestal", "plinth", "podium", "base", "stand"],
+    vase:     ["vase", "urn", "jar", "amphora"],
+    tower:    ["tower", "skyscraper", "ziggurat", "temple", "spire"],
+    tree:     ["tree", "shrub", "bush", "pine", "oak", "maple", "sapling"],
+    pillar:   ["pillar", "column", "post"],
+    pyramid:  ["pyramid", "tetrahedron"],
+    crystal:  ["crystal", "gem", "gemstone", "diamond", "shard", "jewel"],
+    torus:    ["torus", "ring", "donut", "doughnut", "halo"],
+    cone:     ["cone"],
+    cylinder: ["cylinder", "barrel", "drum", "can", "tube", "tin"],
+    rock:     ["rock", "stone", "boulder", "pebble"],
+    sphere:   ["sphere", "ball", "orb", "globe", "bauble", "marble"],
+    cube:     ["cube", "box", "block", "crate", "package", "carton"],
+    bottle:   ["bottle", "flask", "vial"],
+    statue:   ["statue", "sculpture", "figurine", "bust"],
+    bookcase: ["bookcase", "bookshelf", "shelf", "shelves"],
+    book:     ["book", "novel", "tome"],
+    car:      ["car", "automobile", "vehicle", "sedan", "coupe"],
+    bicycle:  ["bicycle", "bike", "cycle"],
+    apple:    ["apple"],
+    pumpkin:  ["pumpkin", "gourd"],
+    mug:      ["mug", "cup"],
+    plant:    ["plant", "fern", "houseplant"],
+    fountain: ["fountain"],
+  };
+
+  // Build reverse lookup
+  var WORD_TO_OBJ = {};
+  for (var canon in SYNONYMS) {
+    SYNONYMS[canon].forEach(function (w) { WORD_TO_OBJ[w] = canon; });
+  }
+
+  var COLOR_WORDS = {
+    red: 0xc62828, crimson: 0xb71c1c, scarlet: 0xc62828, ruby: 0xc62828,
+    orange: 0xef6c00, amber: 0xff8f00, gold: 0xd4af37, golden: 0xd4af37, yellow: 0xf9a825,
+    green: 0x2e7d32, emerald: 0x2e7d32, lime: 0x9ccc65, forest: 0x1b5e20, mint: 0x80cbc4,
+    teal: 0x00897b, turquoise: 0x00acc1, cyan: 0x00acc1,
+    blue: 0x1565c0, navy: 0x0d47a1, royal: 0x1a237e, azure: 0x2196f3, indigo: 0x303f9f,
+    purple: 0x6a1b9a, violet: 0x7e57c2, magenta: 0xc2185b, pink: 0xec407a, lavender: 0xb39ddb,
+    white: 0xeeeeee, ivory: 0xeae0c8, cream: 0xeae0c8, pearl: 0xf5f5f5,
+    black: 0x202020, charcoal: 0x303030, ebony: 0x1c1c1c,
+    gray: 0x707070, grey: 0x707070, silver: 0xc0c0c0,
+    brown: 0x6d4c41, tan: 0xa1887f, beige: 0xd7ccc8, chocolate: 0x4e342e, mahogany: 0x4e1a14,
+    brass: 0xb5a642, copper: 0xb87333, bronze: 0xcd7f32, steel: 0x71797e,
+    rust: 0xb7410e, ochre: 0xcc7722,
+  };
+
+  var MATERIAL_PRESETS = {
+    metal:    { metalness: 0.9, roughness: 0.25, color: 0xb5a642 },
+    metallic: { metalness: 0.9, roughness: 0.25, color: 0xb5a642 },
+    brass:    { metalness: 0.9, roughness: 0.30, color: 0xb5a642 },
+    gold:     { metalness: 1.0, roughness: 0.15, color: 0xd4af37 },
+    golden:   { metalness: 1.0, roughness: 0.15, color: 0xd4af37 },
+    silver:   { metalness: 1.0, roughness: 0.18, color: 0xc0c0c0 },
+    copper:   { metalness: 0.95, roughness: 0.25, color: 0xb87333 },
+    bronze:   { metalness: 0.95, roughness: 0.35, color: 0xcd7f32 },
+    steel:    { metalness: 0.9, roughness: 0.40, color: 0x71797e },
+    chrome:   { metalness: 1.0, roughness: 0.05, color: 0xeeeeee },
+    polished: { metalness: 1.0, roughness: 0.10, color: 0xeeeeee },
+    glass:    { metalness: 0.0, roughness: 0.05, color: 0xb0e0ff, transmission: 0.9, ior: 1.5, thickness: 0.5, opacity: 0.6, transparent: true },
+    crystal:  { metalness: 0.0, roughness: 0.05, color: 0xddf3ff, transmission: 0.85, ior: 1.7, thickness: 0.4, opacity: 0.7, transparent: true },
+    wood:     { metalness: 0.0, roughness: 0.85, color: 0x6d4c41 },
+    wooden:   { metalness: 0.0, roughness: 0.85, color: 0x6d4c41 },
+    oak:      { metalness: 0.0, roughness: 0.80, color: 0x8d6e3f },
+    pine:     { metalness: 0.0, roughness: 0.85, color: 0xcaa472 },
+    stone:    { metalness: 0.05, roughness: 0.95, color: 0x808080 },
+    marble:   { metalness: 0.1,  roughness: 0.30, color: 0xeeeeee },
+    granite:  { metalness: 0.1,  roughness: 0.85, color: 0x7a7a82 },
+    concrete: { metalness: 0.0,  roughness: 0.95, color: 0xa0a0a0 },
+    plastic:  { metalness: 0.0,  roughness: 0.50, color: 0xcccccc },
+    rubber:   { metalness: 0.0,  roughness: 0.95, color: 0x303030 },
+    fabric:   { metalness: 0.0,  roughness: 1.00, color: 0x8d6e63 },
+    cloth:    { metalness: 0.0,  roughness: 1.00, color: 0x8d6e63 },
+    ceramic:  { metalness: 0.0,  roughness: 0.20, color: 0xeeeeee },
+    porcelain:{ metalness: 0.0,  roughness: 0.10, color: 0xf2f2f2 },
+    velvet:   { metalness: 0.0,  roughness: 1.00, color: 0x6a1b9a },
+    leather:  { metalness: 0.1,  roughness: 0.70, color: 0x4e342e },
+    neon:     { metalness: 0.0,  roughness: 0.30, color: 0xff66cc, emissive: 0xff66cc, emissiveIntensity: 1.5 },
+  };
+
+  // very small stemmer — strip common English endings
+  function stem(w) {
+    return w
+      .replace(/(ies)$/, "y")
+      .replace(/(es|s)$/, "")
+      .replace(/(ed|ing)$/, "");
+  }
+
+  function tokens(text) {
+    return (text || "").toLowerCase().match(/[a-z]+/g) || [];
+  }
+
+  function detectColor(text) {
+    var ts = tokens(text);
+    for (var i = 0; i < ts.length; i++) {
+      var key = ts[i];
+      if (COLOR_WORDS[key] !== undefined) return COLOR_WORDS[key];
+      var s = stem(key);
+      if (COLOR_WORDS[s] !== undefined) return COLOR_WORDS[s];
+    }
+    return null;
+  }
+  function detectMaterial(text) {
+    var ts = tokens(text);
+    for (var i = 0; i < ts.length; i++) {
+      if (MATERIAL_PRESETS[ts[i]] !== undefined) return ts[i];
+      var s = stem(ts[i]);
+      if (MATERIAL_PRESETS[s] !== undefined) return s;
+    }
+    // fuzzy: "made of stone", "carved from wood" — already matched above
+    if (/\b(transparent|clear|see[-\s]through)\b/i.test(text)) return "glass";
+    if (/\b(carved|hand[-\s]carved)\b/i.test(text) && !detectMaterial.__guard) return null;
+    return null;
+  }
+  var NUMBER_WORDS = {
+    one: 1, a: 1, an: 1, single: 1, lone: 1,
+    two: 2, pair: 2, couple: 2, both: 2,
+    three: 3, trio: 3, few: 3, several: 3, some: 3,
+    four: 4, quartet: 4,
+    five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+    dozen: 12,
+    many: 7, lots: 7, scattered: 7, cluster: 7, crowd: 7, garden: 7, grove: 7, forest: 9,
+  };
+  function detectCount(text) {
+    var ts = tokens(text);
+    for (var i = 0; i < ts.length; i++) {
+      var n = parseInt(ts[i], 10);
+      if (!isNaN(n) && n > 0 && n < 50) return n;
+      if (NUMBER_WORDS[ts[i]] !== undefined) return NUMBER_WORDS[ts[i]];
+    }
+    return 1;
+  }
+  function detectScale(text) {
+    var t = text.toLowerCase();
+    if (/\b(giant|massive|huge|enormous|towering|colossal|titanic)\b/.test(t)) return 1.7;
+    if (/\b(big|large|tall)\b/.test(t)) return 1.25;
+    if (/\b(tiny|miniature|small|little)\b/.test(t)) return 0.6;
+    return 1.0;
+  }
+  function detectLighting(text) {
+    var t = text.toLowerCase();
+    if (/\b(dramatic|theatrical|noir|moody)\b/.test(t)) return "dramatic";
+    if (/\b(sunset|sundown|dusk|golden hour|warm)\b/.test(t)) return "sunset";
+    if (/\b(neon|cyberpunk|night|nocturnal|after dark)\b/.test(t)) return "night_neon";
+    if (/\b(overcast|cloudy|grey day|gray day|soft)\b/.test(t)) return "overcast";
+    if (/\b(sunny|daytime|noon|outdoor|bright)\b/.test(t)) return "outdoor_sunny";
+    if (/\b(studio|product shot|isolated)\b/.test(t)) return "studio";
+    return null;
+  }
+
+  function parsePrompt(text) {
+    var ts = tokens(text);
+    var matched = []; var used = {};
+    // pass 1: exact match
+    for (var i = 0; i < ts.length; i++) {
+      var canon = WORD_TO_OBJ[ts[i]];
+      if (canon && !used[canon]) { matched.push(canon); used[canon] = true; }
+    }
+    // pass 2: stemmed match
+    if (matched.length < 2) {
+      for (var i = 0; i < ts.length; i++) {
+        var s = stem(ts[i]);
+        var canon = WORD_TO_OBJ[s];
+        if (canon && !used[canon]) { matched.push(canon); used[canon] = true; }
+      }
+    }
+    if (matched.length === 0) matched.push("crystal");
+
+    // pedestal handling: don't treat pedestal as hero if there are other matches
+    if (matched.length > 1 && matched[0] === "pedestal") {
+      matched.push(matched.shift());
+    }
+
+    return {
+      hero: matched[0],
+      extras: matched.slice(1),
+      color: detectColor(text),
+      material: detectMaterial(text),
+      count: detectCount(text),
+      scale: detectScale(text),
+      lightingHint: detectLighting(text),
+    };
+  }
+
+  // ===============================================================
+  // 3. WIKIPEDIA IMAGE LOOKUP
+  // ===============================================================
+  //
+  // Two-step: opensearch to find the best article title for the object,
+  // then pageimages to get the article's lead photo. Free, CORS-friendly,
+  // no API key needed.
+
+  var imageCache = Object.create(null);
+
+  async function fetchWikipediaImage(query) {
+    if (imageCache[query]) return imageCache[query];
+    try {
+      var searchUrl = "https://en.wikipedia.org/w/api.php?action=opensearch&search="
+        + encodeURIComponent(query) + "&limit=3&format=json&origin=*";
+      var res = await fetch(searchUrl);
+      var data = await res.json();
+      var titles = data[1] || [];
+      if (!titles.length) { imageCache[query] = null; return null; }
+
+      // try each candidate title until one has a pageimage
+      for (var i = 0; i < titles.length; i++) {
+        var title = titles[i];
+        var imgUrl = "https://en.wikipedia.org/w/api.php?action=query&format=json"
+          + "&prop=pageimages&pithumbsize=512&titles=" + encodeURIComponent(title) + "&origin=*";
+        var r2 = await fetch(imgUrl);
+        var d2 = await r2.json();
+        var pages = d2.query && d2.query.pages;
+        if (!pages) continue;
+        var first = pages[Object.keys(pages)[0]];
+        if (first && first.thumbnail && first.thumbnail.source) {
+          var entry = { url: first.thumbnail.source, title: title };
+          imageCache[query] = entry;
+          return entry;
+        }
+      }
+      imageCache[query] = null;
+      return null;
+    } catch (e) {
+      console.warn("Wikipedia fetch failed for", query, e);
+      return null;
+    }
+  }
+
+  function loadTexture(url) {
+    return new Promise(function (resolve, reject) {
+      var loader = new THREE.TextureLoader();
+      loader.setCrossOrigin("anonymous");
+      loader.load(url, function (tex) {
+        if (THREE.SRGBColorSpace !== undefined) tex.colorSpace = THREE.SRGBColorSpace;
+        tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        resolve(tex);
+      }, undefined, function (err) { reject(err); });
+    });
+  }
+
+  // Convert pretty canonical names into search queries that resolve well on Wikipedia
+  var SEARCH_TERMS = {
+    lamp: "table lamp",
+    teapot: "teapot",
+    chair: "armchair",
+    table: "wooden table",
+    house: "log cabin",
+    pedestal: "stone pedestal",
+    vase: "ceramic vase",
+    tower: "stone tower",
+    tree: "pine tree",
+    pillar: "stone column",
+    pyramid: "pyramid",
+    crystal: "quartz crystal",
+    torus: "torus",
+    cone: "traffic cone",
+    cylinder: "metal barrel",
+    rock: "boulder rock",
+    sphere: "glass marble",
+    cube: "wooden cube",
+    bottle: "glass bottle",
+    statue: "marble statue",
+    bookcase: "wooden bookcase",
+    book: "book",
+    car: "sports car",
+    bicycle: "bicycle",
+    apple: "apple fruit",
+    pumpkin: "pumpkin",
+    mug: "coffee mug",
+    plant: "houseplant",
+    fountain: "garden fountain",
+  };
+
+  // ===============================================================
+  // 4. MATERIALS
+  // ===============================================================
+  function makeMaterial(materialKey, colorOverride) {
+    var preset = MATERIAL_PRESETS[materialKey] || MATERIAL_PRESETS.plastic;
+    var params = Object.assign({}, preset);
+    if (colorOverride !== undefined && colorOverride !== null) params.color = colorOverride;
+    if (preset.transmission !== undefined && THREE.MeshPhysicalMaterial) {
+      return new THREE.MeshPhysicalMaterial(params);
+    }
+    delete params.transmission; delete params.ior; delete params.thickness;
+    return new THREE.MeshStandardMaterial(params);
+  }
+
+  // applies a texture to all primary meshes inside an object group
+  function applyTexture(group, texture) {
+    group.traverse(function (n) {
+      if (n.isMesh && n.material && !n.userData.skipTexture) {
+        if (n.material.transmission !== undefined) return; // glass: keep transparent
+        if (n.material.emissive && n.material.emissive.r > 0.1) return; // lamp shade: skip
+        n.material.map = texture;
+        n.material.color.set(0xffffff);
+        n.material.needsUpdate = true;
+      }
+    });
+  }
+
+  // ===============================================================
+  // 5. SHAPE BUILDERS
+  // ===============================================================
+  function wrap1(meshOrGroup, halfHeight) {
+    var grp = new THREE.Group();
+    grp.add(meshOrGroup);
+    if (meshOrGroup.castShadow !== undefined) meshOrGroup.castShadow = true;
+    if (meshOrGroup.traverse) meshOrGroup.traverse(function (c) { if (c.isMesh) c.castShadow = true; });
+    grp.position.y = halfHeight || 0;
+    return grp;
+  }
+
+  function buildCube(o)    { var s = o.size||1; return wrap1(new THREE.Mesh(new THREE.BoxGeometry(s,s,s), makeMaterial(o.material, o.color)), s/2); }
+  function buildSphere(o)  { var r = o.size||0.7; return wrap1(new THREE.Mesh(new THREE.SphereGeometry(r, 48, 32), makeMaterial(o.material, o.color)), r); }
+  function buildCrystal(o) { var r = o.size||0.8; return wrap1(new THREE.Mesh(new THREE.IcosahedronGeometry(r, 0), makeMaterial(o.material||"crystal", o.color)), r); }
+  function buildTorus(o)   { var r = o.size||0.7; return wrap1(new THREE.Mesh(new THREE.TorusGeometry(r, r*0.32, 24, 64), makeMaterial(o.material, o.color)), r); }
+  function buildCone(o)    { var r=o.size||0.7, h=(o.size||1)*1.6; return wrap1(new THREE.Mesh(new THREE.ConeGeometry(r,h,36), makeMaterial(o.material, o.color)), h/2); }
+  function buildCylinder(o){ var r=(o.size||0.6), h=(o.size||1)*1.4; return wrap1(new THREE.Mesh(new THREE.CylinderGeometry(r,r,h,40), makeMaterial(o.material, o.color)), h/2); }
+  function buildPillar(o)  { var r=(o.size||0.4), h=(o.size||1)*3.0; return wrap1(new THREE.Mesh(new THREE.CylinderGeometry(r, r*1.1, h, 40), makeMaterial(o.material||"stone", o.color)), h/2); }
+  function buildBottle(o)  {
+    var pts = [];
+    for (var i = 0; i <= 18; i++) {
+      var t = i / 18, r;
+      if (t < 0.15) r = 0.35;
+      else if (t < 0.55) r = 0.35;
+      else if (t < 0.75) r = 0.35 - (t - 0.55) * 1.2;
+      else r = 0.12;
+      pts.push(new THREE.Vector2(Math.max(0.05, r), t * 1.4));
+    }
+    return wrap1(new THREE.Mesh(new THREE.LatheGeometry(pts, 40), makeMaterial(o.material || "glass", o.color)), 0);
+  }
+  function buildTower(o) {
+    var grp = new THREE.Group();
+    var segs = 4 + Math.floor((o.size||1)*3);
+    var baseSize = o.size||0.7, y = 0;
+    for (var i = 0; i < segs; i++) {
+      var s = baseSize*(1 - i/(segs*1.5)), h = s*0.9;
+      var mesh = new THREE.Mesh(new THREE.BoxGeometry(s*2, h, s*2), makeMaterial(o.material||"stone", o.color));
+      mesh.position.y = y + h/2; mesh.castShadow = true; grp.add(mesh); y += h;
+    }
+    return wrap1(grp, 0);
+  }
+  function buildLamp(o) {
+    var grp = new THREE.Group();
+    var mat = makeMaterial(o.material||"brass", o.color);
+    var base = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.5, 0.1, 32), mat); base.position.y = 0.05; grp.add(base);
+    var stem = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 1.5, 16), mat); stem.position.y = 0.85; grp.add(stem);
+    var shadeMat = new THREE.MeshStandardMaterial({ color: 0xfaf3d8, side: THREE.DoubleSide, emissive: 0xfff2a8, emissiveIntensity: 0.35, roughness: 0.7 });
+    var shade = new THREE.Mesh(new THREE.ConeGeometry(0.45, 0.5, 32, 1, true), shadeMat);
+    shade.position.y = 1.85; shade.userData.skipTexture = true; grp.add(shade);
+    var bulb = new THREE.PointLight(0xfff2a8, 1.2, 8, 1.8);
+    bulb.position.y = 1.7; bulb.castShadow = true; grp.add(bulb);
+    return wrap1(grp, 0);
+  }
+  function buildChair(o) {
+    var grp = new THREE.Group();
+    var mat = makeMaterial(o.material||"wood", o.color);
+    var seat = new THREE.Mesh(new THREE.BoxGeometry(1, 0.1, 1), mat); seat.position.y = 0.55; grp.add(seat);
+    [[-0.4,-0.4],[0.4,-0.4],[-0.4,0.4],[0.4,0.4]].forEach(function (p) {
+      var leg = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.5, 0.1), mat);
+      leg.position.set(p[0], 0.25, p[1]); grp.add(leg);
+    });
+    var back = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 0.1), mat);
+    back.position.set(0, 1.05, -0.45); grp.add(back);
+    return wrap1(grp, 0);
+  }
+  function buildTable(o) {
+    var grp = new THREE.Group();
+    var mat = makeMaterial(o.material||"wood", o.color);
+    var top = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.1, 1.2), mat); top.position.y = 0.85; grp.add(top);
+    [[-0.85,-0.5],[0.85,-0.5],[-0.85,0.5],[0.85,0.5]].forEach(function (p) {
+      var leg = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.85, 0.1), mat);
+      leg.position.set(p[0], 0.425, p[1]); grp.add(leg);
+    });
+    return wrap1(grp, 0);
+  }
+  function buildTree(o) {
+    var grp = new THREE.Group();
+    var trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.16, 1.0, 16), makeMaterial("wood", 0x6d4c41)); trunk.position.y = 0.5; grp.add(trunk);
+    var foliage = new THREE.Mesh(new THREE.ConeGeometry(0.7, 1.6, 16), makeMaterial("plastic", o.color || 0x2e7d32)); foliage.position.y = 1.6; grp.add(foliage);
+    return wrap1(grp, 0);
+  }
+  function buildHouse(o) {
+    var grp = new THREE.Group();
+    var body = new THREE.Mesh(new THREE.BoxGeometry(2.2, 1.6, 1.8), makeMaterial(o.material||"wood", o.color||0xa1887f)); body.position.y = 0.8; grp.add(body);
+    var roof = new THREE.Mesh(new THREE.ConeGeometry(1.7, 1.0, 4), makeMaterial("stone", 0x5d4037)); roof.position.y = 2.1; roof.rotation.y = Math.PI/4; roof.userData.skipTexture = true; grp.add(roof);
+    var door = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.7, 0.05), makeMaterial("wood", 0x4e342e)); door.position.set(0, 0.45, 0.92); door.userData.skipTexture = true; grp.add(door);
+    return wrap1(grp, 0);
+  }
+  function buildPedestal(o) {
+    var grp = new THREE.Group();
+    var mk = function () { return makeMaterial(o.material||"stone", o.color); };
+    var base = new THREE.Mesh(new THREE.CylinderGeometry(0.85, 1.0, 0.25, 48), mk()); base.position.y = 0.125; grp.add(base);
+    var col  = new THREE.Mesh(new THREE.CylinderGeometry(0.7, 0.7, 1.0, 48), mk()); col.position.y = 0.75; grp.add(col);
+    var top  = new THREE.Mesh(new THREE.CylinderGeometry(0.85, 0.85, 0.15, 48), mk()); top.position.y = 1.325; grp.add(top);
+    return wrap1(grp, 0);
+  }
+  function buildVase(o) {
+    var pts = [];
+    for (var i = 0; i <= 14; i++) {
+      var t = i / 14, r = 0.35 + 0.25*Math.sin(t*Math.PI*1.4);
+      pts.push(new THREE.Vector2(r, t*1.4));
+    }
+    return wrap1(new THREE.Mesh(new THREE.LatheGeometry(pts, 48), makeMaterial(o.material||"ceramic", o.color)), 0);
+  }
+  function buildTeapot(o) {
+    var grp = new THREE.Group();
+    var pts = [];
+    for (var i = 0; i <= 12; i++) { var t=i/12, r=0.55*Math.sin(t*Math.PI)+0.15; pts.push(new THREE.Vector2(r, t*0.9)); }
+    var mat = makeMaterial(o.material||"ceramic", o.color);
+    var body = new THREE.Mesh(new THREE.LatheGeometry(pts, 36), mat); body.position.y = 0.05; grp.add(body);
+    var spout = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.12, 0.5, 18), mat); spout.position.set(0.55, 0.6, 0); spout.rotation.z = -Math.PI/4; grp.add(spout);
+    var handle = new THREE.Mesh(new THREE.TorusGeometry(0.25, 0.05, 12, 32, Math.PI), mat); handle.position.set(-0.55, 0.55, 0); handle.rotation.z = Math.PI/2; grp.add(handle);
+    return wrap1(grp, 0);
+  }
+  function buildPyramid(o) { var s=o.size||1.2; var mesh=new THREE.Mesh(new THREE.ConeGeometry(s, s*1.3, 4), makeMaterial(o.material||"stone", o.color)); mesh.rotation.y=Math.PI/4; return wrap1(mesh, (s*1.3)/2); }
+  function buildRock(o) {
+    var r=o.size||0.5, g=new THREE.IcosahedronGeometry(r, 0), pos=g.attributes.position;
+    for (var i = 0; i < pos.count; i++) {
+      pos.setX(i, pos.getX(i)+(Math.random()-0.5)*r*0.25);
+      pos.setY(i, pos.getY(i)+(Math.random()-0.5)*r*0.25);
+      pos.setZ(i, pos.getZ(i)+(Math.random()-0.5)*r*0.25);
+    }
+    g.computeVertexNormals();
+    return wrap1(new THREE.Mesh(g, makeMaterial(o.material||"stone", o.color)), 0);
+  }
+  function buildMug(o) {
+    var grp = new THREE.Group();
+    var mat = makeMaterial(o.material||"ceramic", o.color);
+    var body = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.35, 0.7, 32), mat); body.position.y = 0.35; grp.add(body);
+    var handle = new THREE.Mesh(new THREE.TorusGeometry(0.18, 0.04, 12, 32, Math.PI), mat); handle.position.set(0.42, 0.35, 0); handle.rotation.z = -Math.PI/2; grp.add(handle);
+    return wrap1(grp, 0);
+  }
+  function buildBookcase(o) {
+    var grp = new THREE.Group();
+    var mat = makeMaterial(o.material||"wood", o.color);
+    var frame = new THREE.Mesh(new THREE.BoxGeometry(1.6, 2.4, 0.4), mat); frame.position.y = 1.2; grp.add(frame);
+    // shelves recessed darker
+    var dark = new THREE.MeshStandardMaterial({ color: 0x1d1d1d, roughness: 0.9 });
+    for (var s = 0; s < 4; s++) {
+      var inside = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.5, 0.32), dark);
+      inside.position.set(0, 0.3 + s*0.55, 0.05); inside.userData.skipTexture = true; grp.add(inside);
+    }
+    return wrap1(grp, 0);
+  }
+  function buildBook(o) {
+    var grp = new THREE.Group();
+    var mat = makeMaterial(o.material||"leather", o.color);
+    var cover = new THREE.Mesh(new THREE.BoxGeometry(0.7, 1.0, 0.15), mat); cover.position.y = 0.075; grp.add(cover);
+    return wrap1(grp, 0);
+  }
+  function buildCar(o) {
+    var grp = new THREE.Group();
+    var paint = makeMaterial(o.material||"plastic", o.color||0xc62828);
+    var body = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.6, 1.0), paint); body.position.y = 0.5; grp.add(body);
+    var cabin = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.5, 0.95), paint); cabin.position.set(-0.1, 0.95, 0); grp.add(cabin);
+    var wheelMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.9 });
+    [[-0.7,-0.55],[0.7,-0.55],[-0.7,0.55],[0.7,0.55]].forEach(function (p) {
+      var w = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, 0.2, 24), wheelMat);
+      w.rotation.x = Math.PI/2; w.position.set(p[0], 0.25, p[1]); w.userData.skipTexture = true; grp.add(w);
+    });
+    return wrap1(grp, 0);
+  }
+  function buildBicycle(o) {
+    var grp = new THREE.Group();
+    var mat = makeMaterial(o.material||"steel", o.color||0x1565c0);
+    var fA = new THREE.Mesh(new THREE.TorusGeometry(0.4, 0.04, 8, 32), new THREE.MeshStandardMaterial({color:0x111111,roughness:0.9})); fA.rotation.y = Math.PI/2; fA.position.set(-0.55, 0.4, 0); fA.userData.skipTexture = true; grp.add(fA);
+    var fB = new THREE.Mesh(new THREE.TorusGeometry(0.4, 0.04, 8, 32), new THREE.MeshStandardMaterial({color:0x111111,roughness:0.9})); fB.rotation.y = Math.PI/2; fB.position.set(0.55, 0.4, 0); fB.userData.skipTexture = true; grp.add(fB);
+    var bar = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 1.1, 16), mat); bar.rotation.z = Math.PI/2; bar.position.set(0, 0.75, 0); grp.add(bar);
+    return wrap1(grp, 0);
+  }
+  function buildApple(o) {
+    var r = (o.size || 0.4);
+    var g = new THREE.SphereGeometry(r, 32, 24);
+    var pos = g.attributes.position;
+    for (var i = 0; i < pos.count; i++) { pos.setY(i, pos.getY(i) * 0.95); }
+    g.computeVertexNormals();
+    return wrap1(new THREE.Mesh(g, makeMaterial(o.material||"plastic", o.color||0xc62828)), r);
+  }
+  function buildPumpkin(o) {
+    var r = (o.size || 0.5);
+    var g = new THREE.SphereGeometry(r, 24, 16);
+    var pos = g.attributes.position;
+    for (var i = 0; i < pos.count; i++) {
+      var y = pos.getY(i);
+      pos.setY(i, y * 0.7);
+      // ribbed pattern from theta
+      var x = pos.getX(i), z = pos.getZ(i);
+      var theta = Math.atan2(z, x);
+      var rib = 1 - 0.06 * Math.cos(theta * 8);
+      pos.setX(i, x * rib); pos.setZ(i, z * rib);
+    }
+    g.computeVertexNormals();
+    return wrap1(new THREE.Mesh(g, makeMaterial(o.material||"plastic", o.color||0xef6c00)), r * 0.7);
+  }
+  function buildStatue(o) {
+    var grp = new THREE.Group();
+    var mat = makeMaterial(o.material||"marble", o.color);
+    var torso = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.3, 1.1, 12), mat); torso.position.y = 0.85; grp.add(torso);
+    var head = new THREE.Mesh(new THREE.SphereGeometry(0.25, 24, 16), mat); head.position.y = 1.6; grp.add(head);
+    return wrap1(grp, 0);
+  }
+  function buildPlant(o) {
+    var grp = new THREE.Group();
+    var pot = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.28, 0.4, 24), makeMaterial("ceramic", 0x6d4c41));
+    pot.position.y = 0.2; pot.userData.skipTexture = true; grp.add(pot);
+    var leafMat = makeMaterial("plastic", o.color || 0x2e7d32);
+    for (var i = 0; i < 8; i++) {
+      var leaf = new THREE.Mesh(new THREE.ConeGeometry(0.06, 0.7, 8), leafMat);
+      var a = i * Math.PI * 0.25;
+      leaf.position.set(Math.cos(a) * 0.1, 0.75, Math.sin(a) * 0.1);
+      leaf.rotation.set(Math.cos(a) * 0.3, a, Math.sin(a) * 0.3);
+      grp.add(leaf);
+    }
+    return wrap1(grp, 0);
+  }
+  function buildFountain(o) {
+    var grp = new THREE.Group();
+    var mat = makeMaterial(o.material||"stone", o.color);
+    var basin = new THREE.Mesh(new THREE.CylinderGeometry(1.1, 1.3, 0.3, 48), mat); basin.position.y = 0.15; grp.add(basin);
+    var col = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.25, 0.8, 24), mat); col.position.y = 0.7; grp.add(col);
+    var top = new THREE.Mesh(new THREE.SphereGeometry(0.3, 24, 16), mat); top.position.y = 1.25; grp.add(top);
+    return wrap1(grp, 0);
+  }
+
+  var BUILDERS = {
+    cube: buildCube, sphere: buildSphere, crystal: buildCrystal, torus: buildTorus,
+    cone: buildCone, cylinder: buildCylinder, pillar: buildPillar, tower: buildTower,
+    lamp: buildLamp, chair: buildChair, table: buildTable, tree: buildTree,
+    house: buildHouse, pedestal: buildPedestal, vase: buildVase, teapot: buildTeapot,
+    pyramid: buildPyramid, rock: buildRock, bottle: buildBottle, mug: buildMug,
+    bookcase: buildBookcase, book: buildBook, car: buildCar, bicycle: buildBicycle,
+    apple: buildApple, pumpkin: buildPumpkin, statue: buildStatue, plant: buildPlant,
+    fountain: buildFountain,
+  };
+
+  // ===============================================================
+  // 6. LIGHTING
+  // ===============================================================
+  function configureShadow(light) {
+    light.shadow.mapSize.width = 1024; light.shadow.mapSize.height = 1024;
+    light.shadow.camera.near = 0.5; light.shadow.camera.far = 30;
+    var d = 8; light.shadow.camera.left = -d; light.shadow.camera.right = d;
+    light.shadow.camera.top = d; light.shadow.camera.bottom = -d;
+  }
+  function applyLighting(key) {
+    var presets = {
+      studio: function () {
+        scene.background = new THREE.Color(0x21262f);
+        lightRoot.add(new THREE.AmbientLight(0xffffff, 0.4));
+        var k = new THREE.DirectionalLight(0xfff3e2, 1.2);
+        k.position.set(5, 7, 4); k.castShadow = true; configureShadow(k); lightRoot.add(k);
+        lightRoot.add(Object.assign(new THREE.DirectionalLight(0xb6d4ff, 0.6), { position: new THREE.Vector3(-5,4,-2) }));
+        lightRoot.add(Object.assign(new THREE.DirectionalLight(0xffffff, 0.4), { position: new THREE.Vector3(0,4,-6) }));
+      },
+      dramatic: function () {
+        scene.background = new THREE.Color(0x0d0f14);
+        lightRoot.add(new THREE.AmbientLight(0xffffff, 0.08));
+        var k = new THREE.DirectionalLight(0xfff1d4, 2.8);
+        k.position.set(6, 10, 2); k.castShadow = true; configureShadow(k); lightRoot.add(k);
+        var rim = new THREE.DirectionalLight(0x6ea8ff, 0.6); rim.position.set(-6, 3, -4); lightRoot.add(rim);
+      },
+      sunset: function () {
+        scene.background = new THREE.Color(0x412a2a);
+        lightRoot.add(new THREE.AmbientLight(0xff9a6e, 0.35));
+        var sun = new THREE.DirectionalLight(0xff7d3b, 1.8);
+        sun.position.set(-8, 2.5, 4); sun.castShadow = true; configureShadow(sun); lightRoot.add(sun);
+        lightRoot.add(new THREE.HemisphereLight(0xff9a6e, 0x3d1f1a, 0.3));
+      },
+      overcast: function () {
+        scene.background = new THREE.Color(0x494d54);
+        lightRoot.add(new THREE.AmbientLight(0xffffff, 0.7));
+        var sun = new THREE.DirectionalLight(0xeef3ff, 0.5);
+        sun.position.set(3, 10, 2); sun.castShadow = true; configureShadow(sun); lightRoot.add(sun);
+      },
+      night_neon: function () {
+        scene.background = new THREE.Color(0x080a12);
+        lightRoot.add(new THREE.AmbientLight(0x1a2540, 0.4));
+        var p1 = new THREE.PointLight(0xff5fd2, 6, 14, 1.5); p1.position.set(-3, 2.5, 2); lightRoot.add(p1);
+        var p2 = new THREE.PointLight(0x33e0ff, 6, 14, 1.5); p2.position.set(3, 2.5, -2); lightRoot.add(p2);
+        var top = new THREE.DirectionalLight(0xaaccff, 0.15);
+        top.position.set(0, 8, 0); top.castShadow = true; configureShadow(top); lightRoot.add(top);
+      },
+      outdoor_sunny: function () {
+        scene.background = new THREE.Color(0x8ab9ff);
+        lightRoot.add(new THREE.HemisphereLight(0xcfe2ff, 0x5d6d3c, 0.6));
+        var sun = new THREE.DirectionalLight(0xfff6d6, 2.2);
+        sun.position.set(6, 12, 4); sun.castShadow = true; configureShadow(sun); lightRoot.add(sun);
+      },
+    };
+    (presets[key] || presets.studio)();
+  }
+
+  function addGround(lightingKey) {
+    var colors = {
+      studio:0x2c303a, dramatic:0x1a1d22, sunset:0x3a2a26,
+      overcast:0x3a3d44, night_neon:0x141822, outdoor_sunny:0x4d5340,
+    };
+    var g = new THREE.CircleGeometry(15, 64); g.rotateX(-Math.PI/2);
+    var m = new THREE.MeshStandardMaterial({ color: colors[lightingKey]||0x2c303a, roughness: 0.95, metalness: 0.0 });
+    var mesh = new THREE.Mesh(g, m); mesh.receiveShadow = true;
+    sceneRoot.add(mesh);
+  }
+
+  // ===============================================================
+  // 7. CAMERA FRAMING
+  // ===============================================================
+  function aimCamera(key) {
+    var box = new THREE.Box3().setFromObject(sceneRoot);
+    if (box.isEmpty()) { camera.position.set(6,4,8); controls.target.set(0,1,0); controls.update(); return; }
+    var target = box.getCenter(new THREE.Vector3());
+    var size = box.getSize(new THREE.Vector3());
+    var maxDim = Math.max(size.x, size.y, size.z, 1.0);
+    var presets = {
+      hero:    { dir: new THREE.Vector3(0.6, 0.4, 0.7), dist: 3.4 },
+      front:   { dir: new THREE.Vector3(0,   0.25, 1),  dist: 3.6 },
+      top:     { dir: new THREE.Vector3(0.2, 1.2, 0.2), dist: 3.0 },
+      closeup: { dir: new THREE.Vector3(0.4, 0.2, 0.9), dist: 2.2 },
+    };
+    var cfg = presets[key] || presets.hero;
+    var distance = maxDim * cfg.dist;
+    var dir = cfg.dir.clone().normalize().multiplyScalar(distance);
+    camera.position.copy(target).add(dir);
+    controls.target.copy(target);
+    controls.update();
+  }
+
+  // ===============================================================
+  // 8. SCENE GENERATION (async — image fetch + texture loading)
+  // ===============================================================
+  function clearGroup(g) {
+    while (g.children.length) {
+      var c = g.children[0]; g.remove(c);
+      c.traverse && c.traverse(function (n) {
+        if (n.geometry) n.geometry.dispose();
+        if (n.material) {
+          if (Array.isArray(n.material)) n.material.forEach(function (m) { m.dispose(); });
+          else n.material.dispose();
+        }
+      });
+    }
+  }
+
+  async function generateScene(text, lightingKey, cameraKey, useReferencePhotos) {
+    try {
+      clearGroup(sceneRoot);
+      clearGroup(lightRoot);
+      applyLighting(lightingKey);
+      addGround(lightingKey);
+
+      var plan = parsePrompt(text);
+      var heroOpts = { size: 1.0 * plan.scale, material: plan.material, color: plan.color };
+
+      // Build the scene structure first (no textures yet)
+      var built = []; // list of { name, group }
+      var pedestalRequested = plan.extras.indexOf("pedestal") !== -1;
+
+      if (plan.count > 1 && plan.extras.length === 0) {
+        for (var i = 0; i < plan.count; i++) {
+          var obj = BUILDERS[plan.hero](heroOpts);
+          var radius = 1.5 + (plan.count > 4 ? 1.5 : 0);
+          var angle = (i / plan.count) * Math.PI * 2;
+          obj.position.x = Math.cos(angle) * radius + (Math.random()-0.5)*0.4;
+          obj.position.z = Math.sin(angle) * radius + (Math.random()-0.5)*0.4;
+          obj.rotation.y = Math.random() * Math.PI * 2;
+          sceneRoot.add(obj);
+          if (i === 0) built.push({ name: plan.hero, group: obj });
+        }
+      } else {
+        var hero = BUILDERS[plan.hero](heroOpts);
+        if (pedestalRequested) {
+          var ped = BUILDERS.pedestal({ size: 1.0, material: (plan.material === "glass" ? "stone" : plan.material), color: null });
+          sceneRoot.add(ped);
+          hero.position.y += 1.5;
+          built.push({ name: "pedestal", group: ped });
+        }
+        sceneRoot.add(hero);
+        built.push({ name: plan.hero, group: hero });
+
+        var extras = plan.extras.filter(function (e) { return e !== "pedestal"; });
+        extras.forEach(function (name, i) {
+          var obj = BUILDERS[name]({ size: 0.7 * plan.scale, material: plan.material, color: plan.color });
+          var angle = (-Math.PI/3) + (i / Math.max(1, extras.length - 1)) * (2 * Math.PI/3);
+          var radius = 2.2;
+          obj.position.x = Math.cos(angle) * radius;
+          obj.position.z = Math.sin(angle) * radius - 0.5;
+          obj.rotation.y = Math.random() * Math.PI * 2;
+          sceneRoot.add(obj);
+          built.push({ name: name, group: obj });
+        });
+      }
+
+      aimCamera(cameraKey);
+
+      // ----- counts + log -----
+      var polyCount = 0, objCount = 0;
+      sceneRoot.traverse(function (c) {
+        if (c.isMesh) {
+          objCount++;
+          var g = c.geometry;
+          if (g && g.index) polyCount += g.index.count / 3;
+          else if (g && g.attributes && g.attributes.position) polyCount += g.attributes.position.count / 3;
+        }
+      });
+      document.getElementById("obj-count").textContent = objCount;
+      document.getElementById("poly-count").textContent = Math.round(polyCount).toLocaleString();
+
+      var log = [];
+      log.push("Prompt: " + JSON.stringify(text));
+      log.push("Hero: " + plan.hero);
+      if (plan.extras.length) log.push("Extras: " + plan.extras.join(", "));
+      log.push("Material: " + (plan.material || "(per-object default)"));
+      log.push("Color: " + (plan.color !== null ? "#" + plan.color.toString(16) : "(default)"));
+      log.push("Count: " + plan.count + "   Scale: " + plan.scale);
+      if (plan.lightingHint) log.push("Lighting hint from prompt: " + plan.lightingHint);
+      document.getElementById("log").textContent = log.join("\n");
+
+      setStatus("Rendered " + objCount + " object" + (objCount===1?"":"s") + ".", "ok");
+      document.getElementById("dl-png").disabled = false;
+      document.getElementById("dl-glb").disabled = false;
+      document.getElementById("dl-webm").disabled = false;
+      resetAnimationBaselines();
+
+      // ----- Wikipedia photo lookup (in parallel) -----
+      var strip = document.getElementById("thumb-strip");
+      strip.innerHTML = "";
+      if (!useReferencePhotos) return;
+
+      setStatus("Fetching reference photos…", "warn pending");
+      var uniqueNames = [];
+      built.forEach(function (b) { if (uniqueNames.indexOf(b.name) === -1) uniqueNames.push(b.name); });
+
+      var fetches = uniqueNames.map(async function (name) {
+        var query = SEARCH_TERMS[name] || name;
+        var found = await fetchWikipediaImage(query);
+        return { name: name, query: query, found: found };
+      });
+      var results = await Promise.all(fetches);
+
+      // build thumbs + apply textures
+      for (var r = 0; r < results.length; r++) {
+        var res = results[r];
+        var cell = document.createElement("div");
+        cell.className = "thumb-cell";
+        var t = document.createElement("div");
+        t.className = "thumb";
+        if (res.found) {
+          t.style.backgroundImage = "url(" + JSON.stringify(res.found.url) + ")";
+          t.title = res.found.title;
+        } else {
+          t.className += " empty"; t.textContent = "—"; t.title = "No image found";
+        }
+        var lbl = document.createElement("div");
+        lbl.className = "thumb-label";
+        lbl.textContent = res.name; lbl.title = res.query;
+        cell.appendChild(t); cell.appendChild(lbl);
+        strip.appendChild(cell);
+
+        if (res.found) {
+          try {
+            var tex = await loadTexture(res.found.url);
+            built.forEach(function (b) { if (b.name === res.name) applyTexture(b.group, tex); });
+          } catch (texErr) {
+            console.warn("Texture load failed for", res.name, texErr);
+          }
+        }
+      }
+      var withTex = results.filter(function (r) { return r.found; }).length;
+      setStatus("Rendered " + objCount + " objects, " + withTex + " textured from Wikipedia.", "ok");
+
+    } catch (e) {
+      window.__showError("Render failed: " + e.message);
+      console.error(e);
+    }
+  }
+
+  // ===============================================================
+  // 9. DOWNLOADS
+  // ===============================================================
+  function downloadPng() {
+    try {
+      renderer.render(scene, camera);
+      renderer.domElement.toBlob(function (blob) {
+        if (!blob) { setStatus("PNG export failed — canvas may be tainted by a cross-origin texture.", "err"); return; }
+        var url = URL.createObjectURL(blob);
+        var safe = makeFilename(document.getElementById("prompt").value);
+        triggerDownload(url, safe + ".png");
+        setStatus("PNG downloaded.", "ok");
+      }, "image/png");
+    } catch (e) { window.__showError("PNG export failed: " + e.message); }
+  }
+  function recordWebm() {
+    try {
+      if (!renderer.domElement.captureStream) {
+        setStatus("Recording not supported in this browser.", "err"); return;
+      }
+      var seconds = parseInt(document.getElementById("rec-duration").value, 10) || 5;
+      var fps = 30;
+      var stream = renderer.domElement.captureStream(fps);
+      // Pick the best supported mime type
+      var mime = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"]
+        .find(function (m) { return MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m); });
+      if (!mime) { setStatus("No WebM codec supported in this browser.", "err"); return; }
+      var rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 6_000_000 });
+      var chunks = [];
+      rec.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
+      rec.onstop = function () {
+        var blob = new Blob(chunks, { type: mime });
+        var url = URL.createObjectURL(blob);
+        var safe = makeFilename(document.getElementById("prompt").value);
+        triggerDownload(url, safe + ".webm");
+        setStatus("Recorded " + seconds + "s clip (" + (Math.round(blob.size / 1024)) + " KB).", "ok");
+        document.getElementById("dl-webm").disabled = false;
+      };
+      document.getElementById("dl-webm").disabled = true;
+      setStatus("Recording " + seconds + "s…", "warn pending");
+      rec.start();
+      var startedAt = performance.now();
+      var tick = function () {
+        var elapsed = (performance.now() - startedAt) / 1000;
+        if (elapsed >= seconds) { rec.stop(); return; }
+        setStatus("Recording " + Math.ceil(seconds - elapsed) + "s…", "warn pending");
+        setTimeout(tick, 200);
+      };
+      setTimeout(tick, 200);
+    } catch (e) {
+      window.__showError("Recording failed: " + e.message);
+      document.getElementById("dl-webm").disabled = false;
+    }
+  }
+
+  function downloadGlb() {
+    try {
+      var exporter = new GLTFExporter();
+      var exportScene = new THREE.Scene();
+      sceneRoot.children.forEach(function (c) { exportScene.add(c.clone(true)); });
+      exporter.parse(exportScene, function (result) {
+        var blob = (result instanceof ArrayBuffer)
+          ? new Blob([result], { type: "model/gltf-binary" })
+          : new Blob([JSON.stringify(result)], { type: "model/gltf+json" });
+        var url = URL.createObjectURL(blob);
+        var safe = makeFilename(document.getElementById("prompt").value);
+        triggerDownload(url, safe + (result instanceof ArrayBuffer ? ".glb" : ".gltf"));
+        setStatus("GLB downloaded.", "ok");
+      }, function (err) { window.__showError("GLB export failed: " + err); }, { binary: true });
+    } catch (e) { window.__showError("GLB export failed: " + e.message); }
+  }
+  function triggerDownload(url, filename) {
+    var a = document.createElement("a"); a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
+  }
+  function makeFilename(s) {
+    var t = (s || "render").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    return (t || "render").slice(0, 60);
+  }
+  function setStatus(msg, kind) {
+    var el = document.getElementById("status");
+    el.innerHTML = "";
+    var span = document.createElement("span");
+    if (kind) span.className = kind;
+    span.textContent = msg;
+    el.appendChild(span);
+  }
+
+  // ===============================================================
+  // 10. UI WIRING
+  // ===============================================================
+  var PRESETS = [
+    "a brass teapot on a wooden table, dramatic lighting",
+    "a marble statue on a stone pedestal, studio lighting",
+    "a glass bottle of wine and an apple, sunset",
+    "a wooden cabin with a pine tree, golden hour",
+    "scattered glowing neon orbs in a dark scene",
+    "a tall stone tower, overcast",
+    "three copper spheres, polished, soft light",
+    "a chrome torus, outdoor sunny",
+    "a forest of five pine trees, overcast",
+    "a red sports car, dramatic lighting",
+    "a porcelain mug next to a book, studio",
+    "a giant gold pyramid, night neon",
+  ];
+  var presetWrap = document.getElementById("presets");
+  PRESETS.forEach(function (p) {
+    var b = document.createElement("button");
+    b.className = "chip";
+    b.textContent = p.length > 38 ? p.slice(0, 36) + "…" : p;
+    b.title = p;
+    b.addEventListener("click", function () { document.getElementById("prompt").value = p; });
+    presetWrap.appendChild(b);
+  });
+
+  var segButtons = document.querySelectorAll("#camera button");
+  var cameraKey = "hero";
+  segButtons.forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      segButtons.forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      cameraKey = btn.dataset.value;
+    });
+  });
+
+  document.getElementById("generate").addEventListener("click", function () {
+    var text = document.getElementById("prompt").value.trim();
+    var lightingKey = document.getElementById("lighting").value;
+    var usePhotos = document.getElementById("use-photos").checked;
+    if (!text) { setStatus("Enter a description first.", "err"); return; }
+    setStatus("Generating…", "pending");
+    setTimeout(function () { generateScene(text, lightingKey, cameraKey, usePhotos); }, 30);
+  });
+  document.getElementById("dl-png").addEventListener("click", downloadPng);
+  document.getElementById("dl-glb").addEventListener("click", downloadGlb);
+  document.getElementById("dl-webm").addEventListener("click", recordWebm);
+
+  // Animation controls
+  var animModeEl  = document.getElementById("anim-mode");
+  var animSpeedEl = document.getElementById("anim-speed");
+  var animSpeedOut = document.getElementById("anim-speed-out");
+  animState.mode = animModeEl.value;
+  animState.speed = parseFloat(animSpeedEl.value);
+  animSpeedOut.textContent = animState.speed.toFixed(1) + "×";
+
+  animModeEl.addEventListener("change", function () {
+    animState.mode = animModeEl.value;
+    resetAnimationBaselines();
+  });
+  animSpeedEl.addEventListener("input", function () {
+    animState.speed = parseFloat(animSpeedEl.value);
+    animSpeedOut.textContent = animState.speed.toFixed(1) + "×";
+  });
+
+  // Recording duration
+  var recDurEl = document.getElementById("rec-duration");
+  var recDurOut = document.getElementById("rec-duration-out");
+  recDurEl.addEventListener("input", function () { recDurOut.textContent = recDurEl.value + "s"; });
+
+  // initial boot
+  function runBoot() {
+    resize();
+    var s = getStageSize();
+    if (s.w < 60 || s.h < 60) { requestAnimationFrame(runBoot); return; }
+    generateScene(
+      document.getElementById("prompt").value,
+      document.getElementById("lighting").value,
+      cameraKey,
+      document.getElementById("use-photos").checked
+    );
+    animate();
+  }
+  requestAnimationFrame(runBoot);
+
+})();
+</script>
+
+</body>
+</html>
